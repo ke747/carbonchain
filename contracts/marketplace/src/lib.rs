@@ -2,7 +2,7 @@
 #![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
-    IntoVal, String, Symbol, Vec,
+    IntoVal, Map, String, Symbol, Vec,
 };
 
 // ── TTL constants ─────────────────────────────────────────────────────────────
@@ -54,6 +54,20 @@ pub struct Offer {
     pub expires_at: Option<u64>,
 }
 
+/// Aggregate marketplace statistics returned by `get_marketplace_stats`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct MarketplaceStats {
+    /// Total number of offers ever created (including closed/cancelled).
+    pub total_offers: u64,
+    /// Number of currently active (open, non-expired) offers.
+    pub active_offers: u64,
+    /// Cumulative XLM volume (in stroops) across all completed buy_offer calls.
+    pub total_volume_xlm: i128,
+    /// Cumulative token volume per token address for SAC-token-based offers.
+    pub total_volume_tokens: Map<Address, i128>,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -68,6 +82,12 @@ pub enum DataKey {
     Nonce(Address),
     MinPrice,
     ActiveOffers,
+    /// Running count of offers currently in `active = true` state.
+    ActiveOffersCount,
+    /// Cumulative XLM volume (stroops) from completed buy_offer transactions.
+    TotalVolumeXLM,
+    /// Cumulative volume per SAC token address from completed buy_offer transactions.
+    TotalVolumeTokens,
 }
 
 #[contracterror]
@@ -88,6 +108,8 @@ pub enum MarketplaceError {
     AlreadyInitialized = 126,
     /// Buyer does not hold enough XLM to cover the offer price.
     InsufficientFunds = 127,
+    /// `expires_at` is in the past or equal to the current ledger timestamp.
+    InvalidExpiry = 314,
 }
 
 #[contractevent]
@@ -123,6 +145,14 @@ pub struct OfferUpdated {
     pub seller: Address,
     pub offer_id: u64,
     pub new_price_xlm: i128,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct OfferExpiryExtended {
+    pub seller: Address,
+    pub offer_id: u64,
+    pub new_expires_at: u64,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -256,6 +286,13 @@ impl Marketplace {
             return Err(MarketplaceError::InvalidTonnes);
         }
 
+        // #1092: validate expires_at is strictly in the future
+        if let Some(exp) = expires_at {
+            if exp <= env.ledger().timestamp() {
+                return Err(MarketplaceError::InvalidExpiry);
+            }
+        }
+
         let registry_nonce: u64 = env.invoke_contract(
             &registry_id,
             &Symbol::new(&env, "get_nonce"),
@@ -328,6 +365,9 @@ impl Marketplace {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::ActiveOffers, TTL_THRESHOLD, MIN_TTL);
+
+        // #1091: increment active offers counter
+        Self::increment_active_count(&env);
 
         OfferNew { seller, offer_id }.publish(&env);
         Ok(offer_id)
@@ -433,6 +473,9 @@ impl Marketplace {
                 .persistent()
                 .extend_ttl(&DataKey::ActiveOffers, TTL_THRESHOLD, MIN_TTL);
         }
+
+        // #1091: decrement active offers counter
+        Self::decrement_active_count(&env);
 
         OfferCxl {
             seller: seller.clone(),
@@ -758,6 +801,38 @@ impl Marketplace {
                 .extend_ttl(&DataKey::ActiveOffers, TTL_THRESHOLD, MIN_TTL);
         }
 
+        // #1091: decrement active offers counter and accumulate volume
+        Self::decrement_active_count(&env);
+        // All marketplace offers are priced in native XLM (price_xlm in stroops).
+        // Accumulate into TotalVolumeXLM; TotalVolumeTokens tracks SAC-token-based
+        // volume if token_id differs from the native XLM contract in future extensions.
+        let prev_xlm_vol: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalVolumeXLM)
+            .unwrap_or(0i128);
+        let new_xlm_vol = prev_xlm_vol.saturating_add(price);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalVolumeXLM, &new_xlm_vol);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TotalVolumeXLM, TTL_THRESHOLD, MIN_TTL);
+        // Also record per-token volume so callers can distinguish native XLM vs SAC tokens.
+        let mut token_vol: Map<Address, i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalVolumeTokens)
+            .unwrap_or_else(|| Map::new(&env));
+        let prev_tok_vol: i128 = token_vol.get(token_id.clone()).unwrap_or(0i128);
+        token_vol.set(token_id, prev_tok_vol.saturating_add(price));
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalVolumeTokens, &token_vol);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TotalVolumeTokens, TTL_THRESHOLD, MIN_TTL);
+
         Ok(())
     }
 
@@ -782,7 +857,151 @@ impl Marketplace {
         result
     }
 
+    // ── Issue #1091: Marketplace Stats ───────────────────────────────────────
+
+    /// Return aggregate marketplace statistics. Only the admin may call this.
+    ///
+    /// # Errors
+    /// - [`MarketplaceError::NotInitialized`] — contract has not been initialised.
+    /// - [`MarketplaceError::Unauthorized`] — caller is not the admin.
+    pub fn get_marketplace_stats(env: Env, admin: Address) -> Result<MarketplaceStats, MarketplaceError> {
+        Self::require_admin(&env, &admin)?;
+
+        let total_offers: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OfferCount)
+            .unwrap_or(0u64);
+
+        let active_offers: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveOffersCount)
+            .unwrap_or(0u64);
+
+        let total_volume_xlm: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalVolumeXLM)
+            .unwrap_or(0i128);
+
+        let total_volume_tokens: Map<Address, i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalVolumeTokens)
+            .unwrap_or_else(|| Map::new(&env));
+
+        Ok(MarketplaceStats {
+            total_offers,
+            active_offers,
+            total_volume_xlm,
+            total_volume_tokens,
+        })
+    }
+
+    // ── Issue #1093: Extend Offer Expiry ─────────────────────────────────────
+
+    /// Extend the expiry timestamp of an active offer. Only the original seller may call this.
+    ///
+    /// The new expiry must be strictly in the future AND strictly greater than the
+    /// current `expires_at` (offers can only be extended, not shortened).
+    ///
+    /// # Errors
+    /// - [`MarketplaceError::ContractPaused`] — contract is paused.
+    /// - [`MarketplaceError::InvalidNonce`] — `nonce` does not match the current seller nonce.
+    /// - [`MarketplaceError::OfferNotFound`] — no offer exists for `offer_id`.
+    /// - [`MarketplaceError::Unauthorized`] — `seller` is not the offer creator.
+    /// - [`MarketplaceError::AlreadyClosed`] — offer has already been closed.
+    /// - [`MarketplaceError::InvalidExpiry`] — `new_expires_at` is not in the future or not
+    ///   strictly greater than the current `expires_at`.
+    pub fn extend_offer_expiry(
+        env: Env,
+        seller: Address,
+        offer_id: u64,
+        new_expires_at: u64,
+        nonce: u64,
+    ) -> Result<(), MarketplaceError> {
+        if Self::is_paused(&env) {
+            return Err(MarketplaceError::ContractPaused);
+        }
+        seller.require_auth();
+        if !Self::consume_nonce(&env, &seller, nonce) {
+            return Err(MarketplaceError::InvalidNonce);
+        }
+
+        let mut offer: Offer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Offer(offer_id))
+            .ok_or(MarketplaceError::OfferNotFound)?;
+
+        if offer.seller != seller {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        if !offer.active {
+            return Err(MarketplaceError::AlreadyClosed);
+        }
+
+        // new_expires_at must be strictly in the future
+        if new_expires_at <= env.ledger().timestamp() {
+            return Err(MarketplaceError::InvalidExpiry);
+        }
+        // new_expires_at must strictly extend beyond the current expiry (only forward)
+        if new_expires_at <= offer.expires_at.unwrap_or(0) {
+            return Err(MarketplaceError::InvalidExpiry);
+        }
+
+        offer.expires_at = Some(new_expires_at);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Offer(offer_id), &offer);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Offer(offer_id), TTL_THRESHOLD, MIN_TTL);
+
+        OfferExpiryExtended {
+            seller,
+            offer_id,
+            new_expires_at,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     // ── Internal ─────────────────────────────────────────────────────────────
+
+    /// Increment `ActiveOffersCount` by one. Called when a new active offer is created.
+    fn increment_active_count(env: &Env) {
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveOffersCount)
+            .unwrap_or(0u64);
+        let new_count = count.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveOffersCount, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveOffersCount, TTL_THRESHOLD, MIN_TTL);
+    }
+
+    /// Decrement `ActiveOffersCount` by one (saturating at zero). Called on cancel or buy.
+    fn decrement_active_count(env: &Env) {
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveOffersCount)
+            .unwrap_or(0u64);
+        let new_count = count.saturating_sub(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveOffersCount, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveOffersCount, TTL_THRESHOLD, MIN_TTL);
+    }
 
     fn next_id(env: &Env) -> Result<u64, MarketplaceError> {
         let id: u64 = env
