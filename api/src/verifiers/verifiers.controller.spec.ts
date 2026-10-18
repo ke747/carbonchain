@@ -1,12 +1,17 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { CacheService } from '../common/cache.service';
+import { StellarService } from '../stellar/stellar.service';
 import { VerifiersController } from './verifiers.controller';
 import { VerifiersService } from './verifiers.service';
 import { VerifierReputation } from '../../../shared';
 
 // ── Minimal mock for VerifiersService ─────────────────────────────────────────
-const VALID_ADDRESS = 'GAAHI32DQ2BVPGIXQ3WLN4LGFQ6BWLB6BCFKSZB7GKFTRGZJMYUAXTM';
-const UNKNOWN_ADDRESS = 'GBFPCE2WVJIHZ4UUHLRHIWM3YF6A5W3YX65U3NHYXHAPVS7THRTCGEK';
+const VALID_ADDRESS =
+  'GBCI2DH7MEKQUTCXZ7YLEVOZHDMBWPCMB6V46ZQHOUN2BHBWRWYY2JRP';
+const UNKNOWN_ADDRESS =
+  'GAGMTFWZSEDGZ6GQWDDA3QOW54BQE3GEIVSIVZHY6KOHQ4WY26F7VOL7';
 const INVALID_ADDRESS = 'not-a-stellar-address';
 
 const mockVerifiersService = {
@@ -18,6 +23,25 @@ const mockVerifiersService = {
   getReputation: jest.fn(),
 };
 
+const mockConfigService = {
+  get: jest.fn((key: string) => {
+    if (key === 'STELLAR_NETWORK') return 'testnet';
+    if (key === 'JWT_SECRET') return 'test-secret';
+    return undefined;
+  }),
+};
+
+const mockStellarService = {
+  readContract: jest.fn(),
+  invokeContract: jest.fn(),
+};
+
+const mockCacheService = {
+  get: jest.fn(),
+  set: jest.fn(),
+  del: jest.fn(),
+};
+
 describe('VerifiersController', () => {
   let controller: VerifiersController;
 
@@ -26,6 +50,9 @@ describe('VerifiersController', () => {
       controllers: [VerifiersController],
       providers: [
         { provide: VerifiersService, useValue: mockVerifiersService },
+        { provide: ConfigService, useValue: mockConfigService },
+        { provide: StellarService, useValue: mockStellarService },
+        { provide: CacheService, useValue: mockCacheService },
       ],
     }).compile();
 
